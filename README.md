@@ -1,7 +1,8 @@
 # m5-status
 
 **Your Mac at a glance, over SSH.** CPU, GPU, unified RAM, storage, swap and a
-short process table refresh every 10 seconds. No daemon or Python packages.
+short process table refresh every 10 seconds, with passive oMLX loaded-model and
+local download inventory sections. No daemon or Python packages.
 MIT licensed.
 
 ## Quick start
@@ -63,7 +64,7 @@ saved backups before deleting them. No automatic updater or service is created.
 ## Usage
 
 ```text
-m5-status [seconds] [--once] [--details] [--gpu] [--disk PATH]
+m5-status [seconds] [--once] [--details] [--gpu] [--disk PATH] [--omlx-dir PATH]
 m5-status --help
 m5-status --version
 ```
@@ -75,6 +76,8 @@ m5-status --version
   It never invokes sudo itself and preserves normal readings if restricted.
 - `--disk PATH`: also monitor the local filesystem containing an existing
   path; repeatable. Shared APFS containers appear once.
+- `--omlx-dir PATH`: oMLX settings/key directory, default `~/.omlx`.
+  Model storage paths and the local API port come from its `settings.json`.
 
 ```sh
 m5-status --once > snapshot.txt
@@ -89,15 +92,21 @@ Illustrative compact output, with invented values and a generic host:
 M5 Ultra | 30 CPU / 64 GPU cores | Refresh 10s | Uptime 2d 1h 4m
 example.local | 2026-01-01 12:00:00 UTC
 
-CPU     [######------------------]  25.0%
-GPU     [##----------------------]   8.0%  macmon active | 608 / 1620 MHz
+CPU     [######------------------]  25.0%  load: 3.39 3.29 3.27
+GPU     [##----------------------]   8.0%  temp: 53 C | power: 31.36 W avg / 31.24 W now
 RAM~    [#########---------------]  37.5%  24.00 / 64 GiB
 SSD     [############------------]  50.0%  250.00 / 500 GiB (250.00 GiB free)
 Swap    [#-----------------------]   3.1%  32.00 MiB / 1.00 GiB
 
+===== LOADED MODEL =====
+oMLX: none
+
+===== DOWNLOADED MODELS =====
+example-checkpoint (unverified)
+
 Pressure: normal | File-backed: 20.00 GiB
 
-Processes (top CPU + RSS)
+===== TOP PROCESSES =====
     PID  PROCESS                       CPU%       RSS
     123  inference-server               18.0  12.00 GiB
 ```
@@ -106,18 +115,61 @@ Lines adapt to terminal width, with intentional continuation lines when needed.
 Output is ASCII. Colors are limited to interactive looping terminals and respect
 `NO_COLOR`. Redirected output, `--once`, and `TERM=dumb` have no escapes.
 
+All resource rows use the same cyan styling, including zero allocated swap:
+
+```text
+Swap    [------------------------]   0.0%  0.00 B / 0.00 B (not allocated)
+```
+
+## Model information
+
+The loaded section uses oMLX's authenticated, read-only `/api/status` endpoint
+on loopback. It reports physical model IDs from `loaded_models`, not the available
+catalog or profile aliases. `none` means the runtime returned an empty list;
+`unavailable` means status could not be verified. The monitor never loads a model
+or sends inference requests. Runtime-reported unloading does not prove all Metal
+allocations have been released.
+
+The download section reads the configured `model.model_dirs` (or `model_dir`)
+each refresh. It supports direct model roots and flat/two-level directories with
+`config.json`, excluding adapters. It deduplicates resolved paths and checks that
+indexed weight files exist and are nonempty. Missing files are labeled incomplete;
+present, nonempty indexed files are labeled **unverified**. This establishes file
+presence only: integrity, full completeness and loadability remain unverified
+because neither contents, hashes, nor every auxiliary dependency is checked.
+Unindexed or unreadable-index models retain **completeness unverified**. This is
+a local storage inventory, not a promise of loadability.
+HF cache-layout discovery and other model runtimes are not currently supported.
+
+Each lookup runs in a disposable subprocess with a two-second wall-clock limit
+(four seconds total worst case); HTTP has a 0.75-second socket timeout. Lookups
+retry every refresh, with no persistent inventory cache. A failed storage root
+is labeled unavailable alongside any discovered models. Credentials are read
+locally from `main-api-key`, falling back to `auth.api_key` in settings; they are
+never printed or passed in process arguments. HTTP proxies and redirects are
+disabled. No runtime settings are changed.
+
 ## Enhanced GPU monitoring
 
 When available, macmon supplies a bounded 250ms **active residency** sample and
 average active clock / highest advertised DVFS clock. This is activity time,
 not percentage of peak throughput. It uses private macOS APIs and needs no root.
 Only a single verified aggregate residency channel is accepted; device percentages
-are never summed. Missing, invalid or stale samples fall back to a labeled
-**driver snapshot**, whose sampling window is unknown and may be stale. If
+are never summed. Missing, invalid or stale samples fall back to a
+**driver snapshot**, identified in details, whose sampling window is unknown and may be stale. If
 neither source works, the GPU row says unavailable and has no meter.
 
-`--details` includes available frequency-scaled activity, temperature and estimated
-power. Unsupported zero/null sensor fields are omitted from compact output.
+The default GPU row shows utilization, whole-degree temperature from
+`temp.gpu_temp_avg`, and estimated watts directly from `gpu_power` in the same
+macmon sample. Power uses two decimals: `now` is the current sample and `avg` is
+the arithmetic mean of valid samples in the last six dashboard refreshes,
+including this one. Startup averages the available samples. Missing/invalid
+samples consume a window slot but are excluded from the mean. If current power
+is invalid, power text is omitted; temperature is independent. No extra sampling
+is performed. `all_power` and `sys_power` are not used.
+
+`--details` retains source, clock, frequency-scaled activity and sensor diagnostics.
+Unsupported zero/null sensor fields are omitted from compact output.
 macOS updates can change private counters; an advertised field is not proof
 that it works on every chip. CPU/ANE power from macmon is not used.
 
@@ -134,6 +186,9 @@ See [metric and collector details](docs/metrics.md).
 ## Metrics and tested scope
 
 CPU 100% means the whole machine is busy; process CPU 100% means one core.
+The CPU row adds native `os.getloadavg()` 1-, 5- and 15-minute load averages,
+formatted to two decimals. A failed load read omits the suffix while preserving
+the CPU reading; details then labels load unavailable.
 **RAM~** estimates non-file residency: anonymous pages + wired pages + physical
 compressor footprint. It is not Activity Monitor App Memory or exact total
 allocation. Unified CPU/GPU memory has one detected physical capacity; process
@@ -142,12 +197,14 @@ can overlap and are not an exact available-memory total.
 
 Memory pressure is the kernel status, not a free-memory percentage. Swap is
 used / **currently allocated** capacity; that capacity can change. Zero
-allocation has no percentage meter. APFS storage shows container used/free
+allocation with zero used is displayed as an empty 0.0% bar; this is an idle
+display convention, not a division by zero. Failed or invalid readings remain
+unavailable. APFS storage shows container used/free
 capacity once, including shared volumes and snapshots. Disk type labels come
 from native identity metadata; NVMe is not assumed.
 
-Tested on Apple M5 Ultra, macOS 27.0 (arm64), Apple Python 3.9.6 and optional
-macmon 0.8.2. Other hardware/macOS versions and stock Macs without Python are
+Tested on Apple M5 Ultra, macOS 27.0 and 27.0.1 (arm64), Apple Python 3.9.6,
+oMLX 0.7.0 and optional macmon 0.8.2. Other hardware/macOS versions and stock Macs without Python are
 untested. Linux is used for synthetic regression tests only.
 
 ## Development

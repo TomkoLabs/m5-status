@@ -2,11 +2,13 @@
 """A small macOS resource monitor using native tools and Python's stdlib."""
 
 import argparse
+from collections import deque
 import ctypes
 import datetime
 import json
 import math
 import os
+from pathlib import Path
 import plistlib
 import re
 import signal
@@ -16,9 +18,10 @@ import subprocess
 import sys
 import time
 import textwrap
+import urllib.request
 from xml.parsers.expat import ExpatError
 
-VERSION = "0.1.0"
+VERSION = "0.2.2"
 
 
 class CollectorError(Exception):
@@ -106,6 +109,13 @@ def cpu_delta(before, after):
     return 100 * (total - delta[2]) / total
 
 
+def load_averages():
+    try:
+        return os.getloadavg()
+    except OSError:
+        return None
+
+
 class CPU:
     def __init__(self):
         self.lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
@@ -151,6 +161,9 @@ def parse_swap(text):
         values[key] = float(value) * 1024 ** ("KMGTP".index(unit) + 1)
     if not {"total", "used", "free"} <= values.keys():
         raise CollectorError("swap fields missing")
+    if any(not number(v) for v in values.values()) or any(
+            values[k] > values["total"] for k in ("used", "free")):
+        raise CollectorError("swap fields invalid")
     return values
 
 
@@ -256,8 +269,10 @@ def parse_macmon(raw, now=None):
         if number(doc.get("gpu_scaled_ratio"), high=1):
             result["scaled"] = doc["gpu_scaled_ratio"] * 100
         # Zero temperatures/power can be unsupported private counters. Hide them.
-        if number(doc.get("temp", {}).get("gpu_temp_avg"), low=1, high=150):
-            result["temperature"] = doc["temp"]["gpu_temp_avg"]
+        temperatures = doc.get("temp")
+        temperature = temperatures.get("gpu_temp_avg") if isinstance(temperatures, dict) else None
+        if number(temperature, low=1, high=150):
+            result["temperature"] = temperature
         if number(doc.get("gpu_power"), low=0.000001, high=1000):
             result["power"] = doc["gpu_power"]
         return result
@@ -297,6 +312,35 @@ def choose_gpu(sample, driver):
     return {"percent": None, "source": "unavailable"}
 
 
+class GPUSensors:
+    """One slot per refresh, including missing readings; never retain stale watts."""
+
+    def __init__(self):
+        self.power_samples = deque(maxlen=6)
+
+    def observe(self, macmon):
+        sample = macmon if isinstance(macmon, dict) else {}
+        power = sample.get("power")
+        valid_power = number(power, low=0.000001, high=1000)
+        self.power_samples.append(power if valid_power else None)
+        result = {}
+        if number(sample.get("temperature"), low=1, high=150):
+            result["temperature"] = sample["temperature"]
+        if valid_power:
+            valid = [value for value in self.power_samples if value is not None]
+            result.update(power_now=power, power_avg=sum(valid) / len(valid))
+        return result
+
+
+def gpu_sensor_text(gpu):
+    parts = []
+    if "temperature" in gpu:
+        parts.append("temp: {:.0f} C".format(gpu["temperature"]))
+    if "power_now" in gpu:
+        parts.append("power: {:.2f} W avg / {:.2f} W now".format(gpu["power_avg"], gpu["power_now"]))
+    return " | ".join(parts)
+
+
 def capacity(used, total):
     if total >= 1024 ** 3:
         return "{:.2f} / {:g} GiB".format(used / 1024 ** 3, round(total / 1024 ** 3, 2))
@@ -306,6 +350,128 @@ def capacity(used, total):
 def storage_label(info):
     # SolidState comes from disk identity; never infer NVMe from an APFS volume.
     return "SSD" if info.get("SolidState") is True else "Disk" if info.get("SolidState") is False else "Storage"
+
+
+def read_json(path):
+    # Metadata only: never read weights, and reject unexpectedly large documents.
+    with Path(path).open("rb") as stream:
+        raw = stream.read(8 * 1024 * 1024 + 1)
+    if len(raw) > 8 * 1024 * 1024:
+        raise ValueError("metadata too large")
+    return json.loads(raw)
+
+
+def loaded_models(document):
+    names = document["loaded_models"]
+    if (document.get("status") != "ok" or not isinstance(names, list)
+            or any(not isinstance(n, str) or not n.strip() for n in names)
+            or type(document.get("models_loaded")) is not int
+            or document["models_loaded"] != len(names)):
+        raise ValueError("invalid loaded model status")
+    return ["oMLX: " + name for name in sorted(set(names))] or ["oMLX: none"]
+
+
+def query_loaded(base, settings):
+    port = settings["server"]["port"]
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("invalid local port")
+    key_file = base / "main-api-key"
+    key = key_file.read_text().strip() if key_file.exists() else settings.get("auth", {}).get("api_key")
+    headers = {"Authorization": "Bearer " + key} if key else {}
+    request = urllib.request.Request("http://127.0.0.1:{}/api/status".format(port), headers=headers)
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    # Credentials stay on loopback, including when proxy environment variables exist.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with opener.open(request, timeout=0.75) as response:
+        raw = response.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError("status too large")
+    return loaded_models(json.loads(raw))
+
+
+def model_completeness(path):
+    """Check indexed file presence/size; this cannot establish weight integrity."""
+    try:
+        index = path / "model.safetensors.index.json"
+        if not index.exists():
+            return "completeness unverified"
+        weights = read_json(index)["weight_map"]
+        if not isinstance(weights, dict) or not weights:
+            raise ValueError("empty index")
+        names = set(weights.values())
+        missing = 0
+        for name in names:
+            if (not isinstance(name, str) or not name or Path(name).is_absolute()
+                    or ".." in Path(name).parts):
+                raise ValueError("invalid index path")
+            shard = path / name
+            if not shard.is_file() or shard.stat().st_size == 0:
+                missing += 1
+        if missing:
+            return "incomplete: {} indexed files missing/empty".format(missing)
+        return "unverified"
+    except (OSError, ValueError, KeyError, TypeError):
+        return "completeness unverified"
+
+
+def downloaded_models(settings):
+    model = settings["model"]
+    roots = model.get("model_dirs") or [model["model_dir"]]
+    if not isinstance(roots, list) or not roots or any(not isinstance(p, str) or not p for p in roots):
+        raise ValueError("invalid model roots")
+    found, failures = {}, []
+
+    def visit(path, depth):
+        if (path / "adapter_config.json").exists():
+            return
+        if (path / "config.json").is_file():
+            found.setdefault(str(path.resolve()), (path.name, model_completeness(path)))
+            return
+        if depth == 0:
+            return
+        for child in sorted(path.iterdir()):
+            if not child.name.startswith(".") and child.is_dir():
+                visit(child, depth - 1)
+
+    for root in dict.fromkeys(roots):
+        try:
+            path = Path(root).expanduser()
+            if not path.is_absolute():
+                raise ValueError("model root must be absolute")
+            visit(path, 2)
+        except (OSError, ValueError):
+            failures.append("oMLX inventory: unavailable (model directory lookup failed)")
+    rows = ["{} ({})".format(name, state) for name, state in sorted(found.values())]
+    return rows + sorted(set(failures)) or ["oMLX: none"]
+
+
+def model_probe(kind, directory):
+    try:
+        base = Path(directory).expanduser()
+        settings = read_json(base / "settings.json")
+        return query_loaded(base, settings) if kind == "loaded" else downloaded_models(settings)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        # Never display exception text: HTTP/config failures can contain credentials.
+        return ["oMLX: unavailable"]
+
+
+def collect_models(commands, directory):
+    result = {}
+    for kind in ("loaded", "downloaded"):
+        try:
+            # Hard wall-clock bound covers HTTP trickles and slow filesystem metadata.
+            rows = json.loads(commands.run([sys.executable, str(Path(__file__).resolve()),
+                                           "--model-probe", kind, str(directory)], timeout=2))
+            if not isinstance(rows, list) or not rows or any(not isinstance(row, str) for row in rows):
+                raise ValueError("invalid model result")
+            result[kind] = rows
+        except (CollectorError, ValueError, TypeError):
+            result[kind] = ["oMLX: unavailable"]
+    return result
 
 
 def render_snapshot(data, width=100, details=False, color=False):
@@ -320,6 +486,7 @@ def render_snapshot(data, width=100, details=False, color=False):
                                    break_long_words=True, break_on_hyphens=False) or [""])
 
     def row(label, percent, extra=""):
+        first = len(lines)
         main = "{:<7} {}".format(label, meter(percent, bar_width) if percent is not None else "N/A")
         if extra:
             if len(main) + len(extra) + 2 <= width:
@@ -327,8 +494,11 @@ def render_snapshot(data, width=100, details=False, color=False):
             else:
                 add(main)
                 add("        " + extra, "        ")
-                return
-        add(main)
+                main = None
+        if main is not None:
+            add(main)
+        if color:
+            lines[first:] = ["\033[36m" + line + "\033[0m" for line in lines[first:]]
 
     static = data["static"]
     elapsed = data["uptime"]
@@ -339,11 +509,13 @@ def render_snapshot(data, width=100, details=False, color=False):
         static["chip"].removeprefix("Apple "), static["cpu"], static["gpu"], mode, days, hours, rest // 60))
     add("{} | {}".format(data["host"], data["timestamp"]))
     add()
-    row("CPU", data["cpu"])
+    load = data["load"]
+    row("CPU", data["cpu"], "load: " + " ".join("{:.2f}".format(v) for v in load)
+        if load is not None else "")
     gpu = data["gpu"]
-    extra = gpu["source"]
-    if "mhz" in gpu:
-        extra += " | {:g}{} MHz".format(gpu["mhz"], " / {:g}".format(gpu["max_mhz"]) if "max_mhz" in gpu else "")
+    extra = gpu_sensor_text(gpu)
+    if gpu["percent"] is None and not extra:
+        extra = "unavailable"
     row("GPU", gpu["percent"], extra)
     vm = data["vm"]
     used = vm["non_file_estimate"] if vm else None
@@ -356,16 +528,23 @@ def render_snapshot(data, width=100, details=False, color=False):
     if not data["disks"]:
         row("Storage", None, "collector failed")
     swap = data["swap"]
-    if isinstance(swap, dict):
-        row("Swap", 100 * swap["used"] / swap["total"] if swap["total"] else None,
+    if (isinstance(swap, dict) and number(swap.get("total"))
+            and number(swap.get("used"), high=swap["total"])):
+        row("Swap", 100 * swap["used"] / swap["total"] if swap["total"] else 0,
             "{} / {}{}".format(size(swap["used"]), size(swap["total"]),
                 " (not allocated)" if not swap["total"] else ""))
     else:
         row("Swap", None, "unavailable")
     add()
+    models = data.get("models", {})
+    for kind, heading in (("loaded", "LOADED MODEL"), ("downloaded", "DOWNLOADED MODELS")):
+        add("===== " + heading + " =====")
+        for model in models.get(kind, ["oMLX: unavailable"]):
+            add(model, "  ")
+        add()
     add("Pressure: {} | File-backed: {}".format(data["pressure"], size(vm["File-backed pages"]) if vm else "N/A"))
     add()
-    add("Processes (top CPU + RSS)")
+    add("===== TOP PROCESSES =====")
     name_width = max(6, min(26, width - 30))
     add("    PID  {:<{w}}  CPU%       RSS".format("PROCESS", w=name_width))
     for pid, name, pcpu, rss in busiest(data["processes"] or [], 5 if details else 3):
@@ -373,7 +552,8 @@ def render_snapshot(data, width=100, details=False, color=False):
     if details:
         add()
         add("Details | m5-status {} | macOS {} / {}".format(VERSION, static["os"], static["model"]))
-        add("Load 1/5/15m: " + " / ".join("{:.2f}".format(v) for v in data["load"]))
+        add("Load 1/5/15m: " + (" / ".join("{:.2f}".format(v) for v in load)
+            if load is not None else "unavailable"))
         add("CPU: 100% = whole machine; process CPU: 100% = one core. RSS may share pages.")
         if vm:
             add("RAM~ = anonymous {} + wired {} + compressor {}".format(
@@ -387,6 +567,9 @@ def render_snapshot(data, width=100, details=False, color=False):
             add("{} | {} | {}{} | {} available".format(data["labels"].get(mount, "Storage"), mount,
                 capacity(used, total), " | shared APFS container" if shared else "", size(free)))
         add("GPU source: " + gpu["source"])
+        if "mhz" in gpu:
+            add("GPU clock: {:g}{} MHz".format(gpu["mhz"],
+                " / {:g}".format(gpu["max_mhz"]) if "max_mhz" in gpu else ""))
         if gpu["source"] in ("macmon active", "native active"):
             add("GPU active residency: fraction of 250ms sample active; not peak throughput.")
         if "scaled" in gpu:
@@ -402,8 +585,6 @@ def render_snapshot(data, width=100, details=False, color=False):
         add("Collection: {:.2f}s | core commands bounded at 3s".format(data["collection"]))
     for error in data["errors"]:
         add("ERROR: " + error)
-    if color:
-        lines = ["\033[36m" + line + "\033[0m" if "[" in line and "%" in line else line for line in lines]
     return "\n".join(lines) + "\n"
 
 
@@ -411,6 +592,7 @@ class Monitor:
     def __init__(self, commands, args):
         self.commands, self.args = commands, args
         self.optional_failures = {}
+        self.gpu_sensors = GPUSensors()
         self.cpu = CPU()
         self.static = {}
         for key in ("hw.memsize", "hw.ncpu", "hw.model", "machdep.cpu.brand_string",
@@ -472,7 +654,7 @@ class Monitor:
         after = core("CPU", self.cpu.read)
         cpu = core("CPU", lambda: cpu_delta(before, after)) if before and after else None
         vm = core("RAM", lambda: parse_vm(self.text(["/usr/bin/vm_stat"])))
-        swap = self.optional("swap", lambda: parse_swap(self.text(["/usr/sbin/sysctl", "-n", "vm.swapusage"])))
+        swap = core("swap", lambda: parse_swap(self.text(["/usr/sbin/sysctl", "-n", "vm.swapusage"])))
         pressure = self.optional("pressure", lambda: pressure_label(int(self.text(
             ["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"]))))
         disks = core("storage", lambda: storage_rows(
@@ -490,6 +672,7 @@ class Monitor:
                 notes.append(sampled)
         else:
             notes.append(self.macmon_reason)
+        macmon_sample = sampled
         if self.args.gpu:
             native = self.optional("powermetrics", lambda: parse_native_gpu(self.text(
                 ["/usr/bin/powermetrics", "--samplers", "gpu_power", "-i", "250", "-n", "1"])))
@@ -503,17 +686,23 @@ class Monitor:
                 ["/usr/sbin/ioreg", "-r", "-c", "AGXAccelerator", "-a", "-d", "1"]))))
             if isinstance(driver, str):
                 notes.append(driver)
-        data = dict(static=dict(chip=self.static["machdep.cpu.brand_string"], cpu=self.static["hw.ncpu"],
+        models = collect_models(self.commands, self.args.omlx_dir)
+        gpu = choose_gpu(sampled, driver)
+        gpu.update(self.gpu_sensors.observe(macmon_sample))
+        data = dict(models=models, static=dict(chip=self.static["machdep.cpu.brand_string"], cpu=self.static["hw.ncpu"],
                     gpu=self.gpu_cores, os=self.static["kern.osproductversion"], model=self.static["hw.model"]),
                     host=socket.gethostname(), timestamp=datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
                     uptime=max(0, int(time.time() - self.boot)), once=self.args.once, interval=self.args.seconds,
-                    cpu=cpu, load=os.getloadavg(), vm=vm, total=self.total, swap=swap, pressure=pressure,
-                    disks=disks, labels=self.disk_labels, processes=processes, gpu=choose_gpu(sampled, driver),
+                    cpu=cpu, load=load_averages(), vm=vm, total=self.total, swap=swap, pressure=pressure,
+                    disks=disks, labels=self.disk_labels, processes=processes, gpu=gpu,
                     gpu_notes=notes, collection=time.monotonic() - start, errors=errors)
         return render_snapshot(data, width, self.args.details, color), bool(errors)
 
 
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--model-probe" and sys.argv[2] in ("loaded", "downloaded"):
+        print(json.dumps(model_probe(sys.argv[2], sys.argv[3])))
+        return 0
     parser = argparse.ArgumentParser(description="Native macOS resource monitor; Ctrl+C exits.")
     parser.add_argument("seconds", nargs="?", default=10.0, type=interval,
                         help="refresh interval in seconds (default: 10; positive decimal, max 86400)")
@@ -523,6 +712,8 @@ def main():
     parser.add_argument("--gpu", action="store_true", help="add native powermetrics sampling (root); macmon is used automatically when installed")
     parser.add_argument("--disk", action="append", default=[], metavar="PATH",
                         help="also show the local filesystem containing PATH (repeatable)")
+    parser.add_argument("--omlx-dir", type=Path, default=Path.home() / ".omlx", metavar="PATH",
+                        help="oMLX settings/key directory (default: ~/.omlx)")
     args = parser.parse_args()
     for path in args.disk:
         if not os.path.exists(path):

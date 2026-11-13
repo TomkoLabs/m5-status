@@ -3,8 +3,11 @@
 ## CPU and processes
 
 Overall CPU uses a 250ms non-idle delta of Mach HOST_CPU_LOAD_INFO ticks,
-normalized across all CPUs. Load averages in details are native 1/5/15-minute
-values, not percentages. The compact process table combines the top three CPU
+normalized across all CPUs. Load averages on the CPU row and in details are native
+`os.getloadavg()` 1/5/15-minute values, not percentages. The CPU suffix uses
+`load: 3.39 3.29 3.27` formatting. If the read raises `OSError`, the suffix is
+omitted, details says unavailable, and the CPU reading remains usable.
+The compact process table combines the top three CPU
 and top three RSS consumers; details uses five of each, deduplicating PIDs.
 Idle, memory-heavy inference processes stay visible. Names are basenames of
 `ps comm`; full command lines are never requested. Native process CPU accounting
@@ -32,7 +35,11 @@ from free memory. See Apple's [pressure implementation](https://github.com/apple
 and [VM statistics definitions](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/vm_statistics.h).
 Swap uses `vm.swapusage` and its binary units. The denominator is currently
 allocated capacity, which can grow; it is not a fixed maximum. Zero allocation
-has no percentage denominator. Swap percentage alone does not classify pressure.
+has no percentage denominator: a successful zero-used/zero-total sample uses an
+empty 0.0% meter with the shared cyan resource-row styling as an idle display
+convention. Allocated swap uses the actual
+used/total percentage. Missing, nonfinite, negative or impossible readings remain
+unavailable and are retried next frame. Swap percentage alone does not classify pressure.
 
 ## Storage
 
@@ -73,9 +80,29 @@ unaggregated devices are unavailable rather than summed. Neither unavailable
 source nor missing optional fields become zero. Zero active residency from a
 supported fresh source is valid idle activity.
 
-Details can show positive valid GPU temperature and estimated power; zero/null
-sensor values can represent unavailable private counters and are withheld. Only
-GPU power is consumed from macmon. macOS 27 can leave named CPU/ANE energy counters
+The default GPU row shows utilization, then `temp: N C`, then
+`power: A.AA W avg / N.NN W now`, separated by ` | ` when both sensor readings
+are valid. Temperature comes from the same macmon sample's `temp.gpu_temp_avg`,
+rounded to a whole degree (Python nearest, ties to even). Watts come directly from
+`gpu_power`; `all_power` and `sys_power` are never substituted or added.
+
+`now` is the latest sample. `avg` is the arithmetic mean of valid wattages in the
+last six dashboard refreshes, including the current refresh; startup uses the
+samples available so far. Every refresh advances the bounded in-memory window,
+even if its power reading is missing/invalid. Invalid samples are excluded from
+the mean, never replaced with zero. No history persists across runs; `--once`
+therefore has equal average/current values. This is an average of periodic 250ms
+samples, not continuous energy measurement or a time-weighted average.
+
+Existing sensor validity bounds remain: finite numeric temperature 1–150 C and
+power 0.000001–1000 W, excluding booleans. Zero/null values can represent
+unsupported private counters and are withheld. Temperature and power render
+independently; invalid current power hides both average/current power text rather
+than showing stale readings. Invalid temperature does not suppress valid power.
+No additional sampler invocation is made. Source/clock and sensor diagnostics
+remain in details. With `--gpu`, native utilization may take precedence, but the
+compact temperature and power window still use macmon only; native power remains
+a separately sourced details reading. Only GPU power is consumed from macmon. macOS 27 can leave named CPU/ANE energy counters
 visible but frozen; no such fields are treated as measurements here. Private APIs
 can change with macOS/chip versions, so future compatibility is unverified.
 
@@ -92,7 +119,7 @@ Static hardware/disk identity is cached. Each external collector has a three-sec
 timeout. Samplers are finite processes, and their groups are killed/reaped on
 Ctrl+C, TERM, HUP or timeout. No polling daemon or background service is installed.
 Refresh timing includes collection: if a frame exceeds the requested interval,
-the next begins after collection. Optional failures are disabled for the run to
+the next begins after collection. Optional GPU/pressure failures are disabled for the run to
 avoid repeated failed calls; restart to retry. Core failures remain visible and
 make `--once` exit 1. Argument errors exit 2; INT exits 130, TERM 143, HUP 129.
 
@@ -100,3 +127,15 @@ Output wraps intentionally to the terminal width, never relying on terminal
 wrapping. Long process names are shortened. ASCII is used throughout. Color and
 screen clearing are only for looping output to a usable TTY. NO_COLOR disables
 color; `--once`, redirection and TERM=dumb disable all terminal escapes.
+
+## Models
+
+See the [model information contract](../README.md#model-information) for sources,
+authentication, filesystem scope and completeness limitations. Loaded and downloaded
+lookups are independent, read-only and freshly collected each frame, each with a
+two-second subprocess deadline. A 0.75-second HTTP socket timeout is also enforced.
+They never use process memory as evidence of a loaded model, and never equate catalog
+entries or supported context profiles with loaded physical checkpoints. Unlike
+sticky optional GPU failures, model lookup failures retry on every refresh.
+Model lookup failures appear in their own sections without failing otherwise valid
+core metrics or `--once`. Swap collector failures do fail `--once`.
