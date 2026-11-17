@@ -21,7 +21,8 @@ import textwrap
 import urllib.request
 from xml.parsers.expat import ExpatError
 
-VERSION = "0.2.2"
+VERSION = "0.2.4"
+EXTERNAL_MOUNT = "/Volumes/External-Drive"
 
 
 class CollectorError(Exception):
@@ -205,6 +206,21 @@ def parse_df(text):
                              total=int(parts[1]) * 1024, used=int(parts[2]) * 1024,
                              free=int(parts[3]) * 1024, mount=parts[5]))
     return rows
+
+
+def external_storage(commands):
+    """Resolve the current volume by exact mount point, never a cached device ID."""
+    try:
+        entries = parse_df(commands.run(["/bin/df", "-Pk", EXTERNAL_MOUNT]).decode("utf-8", "replace"))
+        if len(entries) != 1 or entries[0]["mount"] != EXTERNAL_MOUNT:
+            return None  # An unmounted leftover directory can resolve to the startup disk.
+        entry = entries[0]
+        total, used, free = (entry[k] for k in ("total", "used", "free"))
+        if total <= 0 or not 0 <= used <= total or not 0 <= free <= total:
+            return None
+        return (EXTERNAL_MOUNT, total, used, free, False)
+    except (CollectorError, ValueError, KeyError, TypeError):
+        return None
 
 
 def storage_rows(df_rows, apfs):
@@ -519,14 +535,27 @@ def render_snapshot(data, width=100, details=False, color=False):
     row("GPU", gpu["percent"], extra)
     vm = data["vm"]
     used = vm["non_file_estimate"] if vm else None
-    row("RAM~", 100 * used / data["total"] if used is not None else None,
+    row("RAM", 100 * used / data["total"] if used is not None else None,
         capacity(used, data["total"]) if used is not None else "collector failed")
+
+    def external_row():
+        external = data.get("external_disk")
+        if external is None:
+            row("SSDe", None, "unavailable")
+        else:
+            _mount, total, used, free, _shared = external
+            row("SSDe", 100 * used / total,
+                "{} ({} free)".format(capacity(used, total), size(free)))
+
     for i, (mount, total, used, free, _shared) in enumerate(data["disks"] or []):
         label = data["labels"].get(mount, "Storage") + (str(i + 1) if i else "")
         row(label, 100 * used / total if total else None,
             "{} ({} free)".format(capacity(used, total), size(free)))
+        if i == 0:
+            external_row()
     if not data["disks"]:
         row("Storage", None, "collector failed")
+        external_row()
     swap = data["swap"]
     if (isinstance(swap, dict) and number(swap.get("total"))
             and number(swap.get("used"), high=swap["total"])):
@@ -556,7 +585,7 @@ def render_snapshot(data, width=100, details=False, color=False):
             if load is not None else "unavailable"))
         add("CPU: 100% = whole machine; process CPU: 100% = one core. RSS may share pages.")
         if vm:
-            add("RAM~ = anonymous {} + wired {} + compressor {}".format(
+            add("RAM estimate = anonymous {} + wired {} + compressor {}".format(
                 size(vm["Anonymous pages"]), size(vm["Pages wired down"]), size(vm["Pages occupied by compressor"])))
             add("Free pages: {} | purgeable: {} | VM page: {}".format(
                 size(vm["Pages free"]), size(vm["Pages purgeable"]), size(vm["page_size"])))
@@ -566,6 +595,12 @@ def render_snapshot(data, width=100, details=False, color=False):
         for mount, total, used, free, shared in data["disks"] or []:
             add("{} | {} | {}{} | {} available".format(data["labels"].get(mount, "Storage"), mount,
                 capacity(used, total), " | shared APFS container" if shared else "", size(free)))
+        if data.get("external_disk") is not None:
+            mount, total, used, free, _shared = data["external_disk"]
+            add("SSDe | {} | {} | {} available | df volume accounting".format(
+                mount, capacity(used, total), size(free)))
+        else:
+            add("SSDe | {} | unavailable".format(EXTERNAL_MOUNT))
         add("GPU source: " + gpu["source"])
         if "mhz" in gpu:
             add("GPU clock: {:g}{} MHz".format(gpu["mhz"],
@@ -616,6 +651,10 @@ class Monitor:
         self.disk_paths = ["/System/Volumes/Data" if os.path.isdir("/System/Volumes/Data") else "/"]
         self.disk_paths += [d["mount"] for d in initial_df if d["mount"].startswith("/Volumes/")]
         self.disk_paths += args.disk
+        # SSDe is independently retried even if absent at startup. Do not let its
+        # disappearance fail the grouped internal/other-disk collector.
+        self.disk_paths = [p for p in self.disk_paths if os.path.abspath(p) != EXTERNAL_MOUNT
+                           and not os.path.abspath(p).startswith(EXTERNAL_MOUNT + "/")]
         self.disk_paths = list(dict.fromkeys(self.disk_paths))
         self.disk_labels = {}
         for path in self.disk_paths:
@@ -662,6 +701,7 @@ class Monitor:
             native_plist(self.commands.run(["/usr/sbin/diskutil", "apfs", "list", "-plist"]))))
         if disks == []:
             errors.append("storage: no local disk rows")
+        external_disk = external_storage(self.commands)
         processes = core("processes", lambda: parse_processes(self.text(
             ["/bin/ps", "-axo", "pid=,pcpu=,rss=,comm="])))
         notes, sampled = [], None
@@ -694,7 +734,7 @@ class Monitor:
                     host=socket.gethostname(), timestamp=datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
                     uptime=max(0, int(time.time() - self.boot)), once=self.args.once, interval=self.args.seconds,
                     cpu=cpu, load=load_averages(), vm=vm, total=self.total, swap=swap, pressure=pressure,
-                    disks=disks, labels=self.disk_labels, processes=processes, gpu=gpu,
+                    disks=disks, external_disk=external_disk, labels=self.disk_labels, processes=processes, gpu=gpu,
                     gpu_notes=notes, collection=time.monotonic() - start, errors=errors)
         return render_snapshot(data, width, self.args.details, color), bool(errors)
 

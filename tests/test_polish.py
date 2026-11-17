@@ -33,6 +33,22 @@ def sample():
 
 
 class Formatting(unittest.TestCase):
+    def test_ram_label_alignment_color_and_unavailable(self):
+        for available in (True,False):
+            data=sample()
+            if not available:data["vm"]=None
+            for details in (False,True):
+                plain=s["render_snapshot"](data,120,details)
+                row=next(line for line in plain.splitlines() if line.startswith("RAM "))
+                expected=("RAM     [#########---------------]  37.5%  24.00 / 64 GiB"
+                          if available else "RAM     N/A  collector failed")
+                self.assertEqual(row,expected)
+                colored=s["render_snapshot"](data,120,details,True)
+                self.assertIn("\x1b[36m"+expected+"\x1b[0m",colored)
+                self.assertNotIn("RAM~",plain)
+                self.assertNotIn("\x1b",plain)
+                if available and details:self.assertIn("RAM estimate = anonymous",plain)
+
     def test_swap_shares_resource_color_for_zero_allocated_and_unavailable(self):
         for swap in ({"used":0,"total":0}, {"used":1,"total":4}, None):
             data=sample();data["swap"]=swap
@@ -66,7 +82,7 @@ class Formatting(unittest.TestCase):
 
     def test_compact_groups_resources_and_preserves_inference(self):
         text=s["render_snapshot"](sample(),120)
-        offsets=[text.index(label) for label in ("CPU     [","GPU     [","RAM~    [","SSD     [","Swap    [")]
+        offsets=[text.index(label) for label in ("CPU     [","GPU     [","RAM     [","SSD     [","Swap    [")]
         self.assertEqual(offsets,sorted(offsets))
         self.assertIn("37.5%",text)
         self.assertIn("24.00 / 64 GiB",text)

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.4 — 2026-11-16
+
+- Use plain `RAM` for the dashboard row while preserving shared styling and
+  unavailable behavior; retain explicit estimate wording in details.
+- Document the unchanged anonymous + wired + physical-compressor calculation,
+  percentage denominator, exclusions and lack of a RAM fallback collector.
+
+## 0.2.3 — 2026-11-16
+
+- Add SSDe below the primary SSD row for `/Volumes/External-Drive`, using
+  volume-wide df capacity/used/available and the shared meter/color format.
+- Verify the exact reported mount point; show N/A for absent, invalid or failed
+  readings, and retry each refresh for automatic reconnect recovery.
+- Exclude the dedicated mount from startup disk grouping to prevent duplicates
+  and keep external failures independent of internal storage readings.
+
 ## 0.2.2 — 2026-11-12
 
 - Show temperature and current/average GPU watts on the default row in GX10

@@ -94,8 +94,9 @@ example.local | 2026-01-01 12:00:00 UTC
 
 CPU     [######------------------]  25.0%  load: 3.39 3.29 3.27
 GPU     [##----------------------]   8.0%  temp: 53 C | power: 31.36 W avg / 31.24 W now
-RAM~    [#########---------------]  37.5%  24.00 / 64 GiB
+RAM     [#########---------------]  37.5%  24.00 / 64 GiB
 SSD     [############------------]  50.0%  250.00 / 500 GiB (250.00 GiB free)
+SSDe    [------------------------]   0.0%  0.00 / 931.32 GiB (931.12 GiB free)
 Swap    [#-----------------------]   3.1%  32.00 MiB / 1.00 GiB
 
 ===== LOADED MODEL =====
@@ -114,6 +115,16 @@ Pressure: normal | File-backed: 20.00 GiB
 Lines adapt to terminal width, with intentional continuation lines when needed.
 Output is ASCII. Colors are limited to interactive looping terminals and respect
 `NO_COLOR`. Redirected output, `--once`, and `TERM=dumb` have no escapes.
+
+`SSDe`, immediately below the primary storage row, monitors the whole volume
+mounted at exactly `/Volumes/External-Drive`. It uses that volume's `df -Pk`
+capacity, used and available counts, converted from KiB to bytes, with the same
+meter/format as SSD. An absent mount, leftover directory on the startup disk, or
+failed/invalid read shows `SSDe N/A unavailable`. It retries each refresh and
+recovers after remounting, even if absent at startup; device IDs are not cached.
+It is excluded from the other storage rows to avoid duplicate reporting.
+APFS volume used + available can be less than total capacity; SSDe preserves
+these native volume figures rather than substituting container allocation.
 
 All resource rows use the same cyan styling, including zero allocated swap:
 
@@ -189,7 +200,7 @@ CPU 100% means the whole machine is busy; process CPU 100% means one core.
 The CPU row adds native `os.getloadavg()` 1-, 5- and 15-minute load averages,
 formatted to two decimals. A failed load read omits the suffix while preserving
 the CPU reading; details then labels load unavailable.
-**RAM~** estimates non-file residency: anonymous pages + wired pages + physical
+**RAM** estimates non-file residency: anonymous pages + wired pages + physical
 compressor footprint. It is not Activity Monitor App Memory or exact total
 allocation. Unified CPU/GPU memory has one detected physical capacity; process
 RSS is not total model/GPU allocation. File-backed and purgeable categories
@@ -199,8 +210,9 @@ Memory pressure is the kernel status, not a free-memory percentage. Swap is
 used / **currently allocated** capacity; that capacity can change. Zero
 allocation with zero used is displayed as an empty 0.0% bar; this is an idle
 display convention, not a division by zero. Failed or invalid readings remain
-unavailable. APFS storage shows container used/free
-capacity once, including shared volumes and snapshots. Disk type labels come
+unavailable. General APFS storage rows show container used/free
+capacity once, including shared volumes and snapshots; the dedicated SSDe row
+uses the mounted volume figures described above. Disk type labels come
 from native identity metadata; NVMe is not assumed.
 
 Tested on Apple M5 Ultra, macOS 27.0 and 27.0.1 (arm64), Apple Python 3.9.6,

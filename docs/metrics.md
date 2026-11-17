@@ -17,12 +17,33 @@ ownership or complete unified GPU memory.
 
 ## Unified memory
 
-Physical RAM comes from `hw.memsize`; page size comes from `vm_stat`. RAM~ is
+Physical RAM comes from `hw.memsize`; page size comes from `vm_stat`. RAM is
 resident anonymous pages + wired pages + pages physically occupied by the
 compressor. It is a non-file residency estimate, rather than Activity Monitor
 Memory Used or App Memory. Other kernel/driver accounting can be omitted.
 Native `top` can include file-backed residency in its broader used-memory figure.
 Neither total minus free nor process RSS is labeled application/model allocation.
+
+The dashboard uses the plain `RAM` label for every state. The former tilde was
+an intentional estimate marker introduced with the compact renderer, not a
+fallback marker or a calculation defect. The calculation is unchanged:
+
+```text
+used bytes = vm_stat page size * (Anonymous pages + Pages wired down
+                                 + Pages occupied by compressor)
+percentage = 100 * used bytes / sysctl hw.memsize
+```
+
+The sum excludes file-backed pages (shown separately), free pages, and swapped-out
+data. It does not add inactive or purgeable categories, which can overlap other
+counts, nor the logical `Pages stored in compressor` value: the compressor's
+physical footprint is already included. It is not exact total system allocation,
+Activity Monitor Memory Used/App Memory, or dedicated GPU/model memory.
+
+There is no RAM fallback collector. Failed or malformed `vm_stat` output renders
+`RAM N/A collector failed`, records the existing core error, and retries at the
+next refresh. A failed reading is never substituted with zero, process RSS or
+total-minus-free. Details explicitly calls the successful reading `RAM estimate`.
 
 File-backed includes cached and mapped files, not all immediately reclaimable.
 Purgeable overlaps other categories and is not added to free/cache/inactive pages
@@ -44,8 +65,8 @@ unavailable and are retried next frame. Swap percentage alone does not classify 
 ## Storage
 
 The internal Data filesystem and mounted local volumes under `/Volumes` are
-selected at startup; `--disk PATH` adds a local filesystem. Restart after mount
-changes. Network filesystems are not monitored. Static native disk identity is
+selected at startup, except the dedicated external mount below; `--disk PATH`
+adds a local filesystem. Restart after other mount changes. Network filesystems are not monitored. Static native disk identity is
 cached: SolidState=true is SSD, false is Disk, unknown is Storage. Interface type
 is not inferred from APFS or a marketing name.
 
@@ -55,6 +76,26 @@ container space, and used is their difference, including other volumes/snapshots
 metadata. A shared container appears once. Purgeable space is not added to free;
 quotas or reservations can constrain an individual volume further. Other local
 filesystems use `df -Pk`. Paths and shared-capacity explanations appear in details.
+
+The dedicated **SSDe** row follows the primary SSD row and uses a separate
+`df -Pk /Volumes/External-Drive` lookup every frame, bounded by the existing
+three-second command timeout. Accept exactly one local device row whose returned
+mount point is exactly `/Volumes/External-Drive`, with positive capacity and
+nonnegative used/free counts no greater than capacity. Checking directory
+existence alone is insufficient: after unmount, a leftover directory can report
+the startup filesystem. A mismatched mount, failed command or invalid result
+renders `SSDe N/A unavailable` without failing the internal disk row or `--once`.
+Failures are not sticky; the next refresh retries, and reconnects may change the
+device ID. This path and its subdirectories are excluded from the startup-selected
+disk group, including `--disk` arguments under that path.
+
+SSDe uses the volume's total, Used and Available fields directly (1024-byte
+blocks), with percent = Used / total. It reuses SSD's binary GiB formatting and
+cyan bar. Unlike general APFS container accounting above, SSDe does not compute
+used = total - available. APFS metadata, shared capacity and reservations can
+leave Used + Available below total; near-empty volumes can round to 0.00 GiB used
+and 0.0%. Details labels this as `df volume accounting`. No file-tree scan, cached
+device identity, mount/unmount action or drive write is performed.
 
 ## GPU
 
